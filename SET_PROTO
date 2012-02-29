@@ -1,0 +1,21 @@
+CLIENT:
+
+master:
+
+add key value (maybe limit) (maybe lockid)   ->
+                                             <-          okay | fail
+
+alive lockid                                 ->
+
+
+slave + master:
+
+monitor [key:txid]  ->
+                        (periodically)
+                        <- key:value [txid->txid]
+
+
+SLAVE
+sync (txid)             ->
+                        <- (DEL)
+                        <- key:value [txid->txid]

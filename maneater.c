@@ -4,21 +4,9 @@
 #include <czmq.h>
 #include <sys/time.h>
 
+#include "maneater.h"
 #include "uuid.h"
 #include "uthash.h"
-
-#define NODEID_LEN (8 + UUID_SIZE + 1)
-
-typedef struct {
-    char *host;
-    void *peer_socket;
-} consensus_host;
-
-typedef enum {
-    ROLE_ELECTING,
-    ROLE_SLAVE,
-    ROLE_MASTER
-} ROLE;
 
 typedef struct {
     char nodeid[NODEID_LEN];
@@ -204,6 +192,9 @@ int input_event(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
         case MID_OBEY:
             handle_obey((message_obey *)data);
             break;
+        case MID_SET:
+            handle_set_message(data + 1, zframe_size(incoming) - 1);
+            break;
         default:
             error_and_fail("unknown message id");
     }
@@ -268,6 +259,7 @@ void loop() {
 int main (int argc, char **argv) {
     handle_args(argc, argv);
     setup_node_state();
+    set_init();
     setup_zeromq();
 
     loop();
