@@ -6,6 +6,8 @@
 #include <pthread.h>
 #include <msgpack.h>
 
+#include "uthash.h"
+
 /* SERVER */
 void handle_args(int argc, char **argv);
 void setup_node_state();
@@ -20,6 +22,9 @@ typedef enum {
 
 #define NODEID_LEN (8 + UUID_SIZE + 1)
 #define HOSTID_LEN (150)
+
+// MAXINT(64)
+#define START_TXID 0xffffffffffffffff
 
 typedef struct {
     char *host;
@@ -37,9 +42,11 @@ void end_slave(zctx_t *ctx);
 int send_to_host(const char *host, zframe_t *frame);
 void set_init();
 void handle_set_message(unsigned char * data, size_t len);
+void handle_follow_message(unsigned char * data, size_t len);
 
 enum {
     MID_SET = 100,
+    MID_FOLLOW,
     MID_VALUE,
     MID_WANT_MASTER,
     MID_IS_MASTER,
@@ -47,7 +54,28 @@ enum {
     MID_S_ALIVE
 };
 
+typedef struct {
+    char *key;
+    void *value;
+    int value_length;
+    int lock;
+    uint64_t limit;
+} proc_message_set;
 
+typedef struct {
+    char *key;
+    int own;
+    proc_message_set *set;
+
+    UT_hash_handle hh;
+} client_want_set;
+
+typedef struct {
+    char *key;
+    uint64_t txid;
+
+    UT_hash_handle hh;
+} client_follow;
 
 /* CLIENT */
 typedef struct {
@@ -62,11 +90,47 @@ typedef struct {
     void **sockets;
     char *sessid;
     int last_tick;
+    void *proc_socket;
     pthread_t thread;
+    client_follow *follows;
+    client_want_set *wants;
+    void *cb; // actually =  maneater_value_callback
 } maneater_client;
 
+// ptr = void *
+// size = length
+typedef struct {
+    uint32_t size;
+    void *ptr;
+} maneater_bin;
+
+typedef void(*maneater_value_callback) (
+    maneater_client *cli,
+    const char *key,
+    maneater_bin *values,
+    int num_values);
+
 maneater_client * maneater_client_new(
-char *iface, char **hosts, int num_hosts);
+char *iface, char **hosts, int num_hosts,
+maneater_value_callback cb
+);
+
+void maneater_client_sub(
+maneater_client * cli,
+const char *key);
+
+void maneater_client_set(maneater_client * cli,
+        const char *key,
+        const void *value,
+        int value_length,
+        int lock,
+        uint64_t limit
+        );
+
+/* XXX unsub */
+
+
+/* HELPER MACROS */
 
 #define MSG_NEXT(msg, data, size, off) ({\
     *off = 0;\
@@ -104,6 +168,11 @@ char *iface, char **hosts, int num_hosts);
 #define COPY_STRING(d, s) ({\
     d = malloc(strlen(s) + 1);\
     strcpy(d, s);\
+    })
+
+#define COPY_MEM(d, s, l) ({\
+    d = malloc(l);\
+    memcpy(d, (const void*)s, l);\
     })
 
 #define MHASH_STRING_SET(h, f, o) ({\

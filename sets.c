@@ -6,7 +6,7 @@
 
 typedef struct stored_value {
     char *lock;
-    msgpack_object_raw data;
+    maneater_bin data;
 
     /* for utlist.h */
     struct stored_value *prev;
@@ -108,11 +108,13 @@ void fire_update(stored_set *s, void *msock) {
         msgpack_pack_uint64(pk, s->txid);
         msgpack_pack_array(pk, s->num_values);
 
-        for (i=0; i < s->num_values; i++) {
-            msgpack_pack_raw(pk, s->values[i].data.size);
+        stored_value *val = NULL;
+        for (val = s->values; val; val = val->next) {
+            printf("packing.. %d %s\n", val->data.size, (char*)val->data.ptr);
+            msgpack_pack_raw(pk, val->data.size);
             msgpack_pack_raw_body(pk,
-                s->values[i].data.ptr,
-                s->values[i].data.size);
+                val->data.ptr,
+                val->data.size);
         }
 
         template = zframe_new(buf->data, buf->size);
@@ -120,13 +122,13 @@ void fire_update(stored_set *s, void *msock) {
 
     if (msock) {
         send = zframe_dup(template);
-        zframe_send(msock, send, 0);
+        zframe_send(&send, msock, 0);
     }
     else {
         if (sstate.role == ROLE_MASTER) {
             for (i=0; i < sstate.num_slaves; i++) {
                 send = zframe_dup(template);
-                zframe_send(sstate.slaves[i].peer_socket, send, 0);
+                zframe_send(&send, sstate.slaves[i].peer_socket, 0);
             }
         }
 
@@ -138,7 +140,7 @@ void fire_update(stored_set *s, void *msock) {
         if (keysubs) {
             HASH_ITER(hh, keysubs->subs, subber, tmp) {
                 send = zframe_dup(template);
-                zframe_send(subber->client_socket, send, 0);
+                zframe_send(&send, subber->client_socket, 0);
             }
         }
     }
@@ -205,8 +207,7 @@ void handle_set_message(unsigned char * data, size_t len) {
                 new->lock = NULL;
             }
 
-            new->data.ptr = malloc(value->size);
-            memcpy((void *)new->data.ptr, value->ptr, value->size);
+            COPY_MEM(new->data.ptr, value->ptr, value->size);
             new->data.size = value->size;
 
             set->num_values++;
@@ -230,13 +231,14 @@ void handle_set_message(unsigned char * data, size_t len) {
         else {
             new->lock = NULL;
         }
-        new->data.ptr = malloc(value->size);
-        memcpy((void *)new->data.ptr, value->ptr, value->size);
+        COPY_MEM(new->data.ptr, value->ptr, value->size);
         new->data.size = value->size;
 
         set->num_values++;
         set->txid = txid;
         LL_APPEND(set->values, new);
+
+        MHASH_STRING_SET(sstate.db, key, set);
 
         fire_update(set, NULL);
     }
@@ -247,11 +249,11 @@ typedef struct {
     unsigned long long txid;
 } follow_pair;
 
-void handle_follow_message(void * data, size_t len) {
+void handle_follow_message(unsigned char * data, size_t len) {
     int person_added = 0;
 
     const char *host = NULL;
-    uint64_t txid; 
+    uint64_t txid;
     msgpack_unpacked msg;
     size_t off;
     const char *key;
@@ -281,12 +283,16 @@ void handle_follow_message(void * data, size_t len) {
         assert(obj->type == MSGPACK_OBJECT_POSITIVE_INTEGER);
         txid = obj->via.u64;
 
+        printf("doing for %s %llu\n", key, (long long unsigned)txid);
+
         HASH_FIND_STR(sstate.subs, key, subkey);
 
         if (!subkey) {
             subkey = (key_sub *)malloc(sizeof(key_sub));
             COPY_STRING(subkey->key, key);
             subkey->subs = NULL;
+
+            MHASH_STRING_SET(sstate.subs, key, subkey);
         }
 
         sublist *app;
@@ -298,12 +304,20 @@ void handle_follow_message(void * data, size_t len) {
             /* NOTE -- pointer to host char * and 
              * socket char * is copied here */
             memcpy(app, subber, sizeof(sublist));
-            HASH_ADD_STR(subkey->subs, host, app);
+            MHASH_STRING_SET(subkey->subs, host, app);
         }
 
         stored_set *ss;
         HASH_FIND_STR(sstate.db, key, ss);
-        if (ss && ss->txid != txid)
+        if (!ss && txid == START_TXID) {
+            stored_set s;
+            s.key = (char *)key;
+            s.values = NULL;
+            s.txid = 0;
+            s.num_values = 0;
+            fire_update(&s, subber->client_socket);
+        }
+        else if (ss && ss->txid != txid)
             fire_update(ss, subber->client_socket);
     }
 }

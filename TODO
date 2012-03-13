@@ -1,1 +1,2 @@
  * Change socket type or use NOBLOCK to prevent blocking?
+ * favor a slave for subs
