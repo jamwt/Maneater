@@ -29,6 +29,11 @@ typedef struct {
 /* SETS */
 
 void start_master(zctx_t *ctx, consensus_host *slaves, int num_slaves);
+void start_slave(zctx_t *ctx, void *master_socket);
+
+void end_master(zctx_t *ctx);
+void end_slave(zctx_t *ctx);
+
 int send_to_host(const char *host, zframe_t *frame);
 void set_init();
 void handle_set_message(unsigned char * data, size_t len);
@@ -72,9 +77,10 @@ char *iface, char **hosts, int num_hosts);
     data += *off; \
     })
 
+/* include the trailing NULL byte for safe string transport */
 #define MSG_PACK_STR(pk, s) ({\
-    msgpack_pack_raw(pk, strlen(s)); \
-    msgpack_pack_raw_body(pk, s, strlen(s));\
+    msgpack_pack_raw(pk, strlen(s) + 1); \
+    msgpack_pack_raw_body(pk, s, strlen(s) + 1);\
     })
 
 #define MSG_START(pk, buf) ({\
@@ -93,6 +99,15 @@ char *iface, char **hosts, int num_hosts);
     block\
     msgpack_packer_free(pk);\
     msgpack_sbuffer_free(buf);\
+    })
+
+#define COPY_STRING(d, s) ({\
+    d = malloc(strlen(s) + 1);\
+    strcpy(d, s);\
+    })
+
+#define MHASH_STRING_SET(h, f, o) ({\
+    HASH_ADD_KEYPTR(hh, h, o->f, strlen(o->f), o);\
     })
 
 #endif /* MANEATER_H */

@@ -32,8 +32,8 @@ int find_master_input(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
     if (msgid == MID_IS_MASTER) {
         MSG_NEXT(&msg, data, size, &off);
         assert(msg.data.type == MSGPACK_OBJECT_RAW);
-        char *host = malloc(msg.data.via.raw.size + 1);
-        strcpy(host, msg.data.via.raw.ptr);
+        char *host;
+        COPY_STRING(host, msg.data.via.raw.ptr);
 
         cli->master = host;
 
@@ -73,7 +73,6 @@ int master_finder(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
 
     for (i=0; i < cli->num_hosts; i++) {
         zframe_t *copy = zframe_dup(out);
-        printf("sending to %p\n", cli->sockets[i]);
         zframe_send(&copy, cli->sockets[i], 0);
     }
     zframe_destroy(&out);
@@ -95,8 +94,27 @@ CLIENT_STATE find_master(maneater_client * cli) {
     return CS_SYNC;
 }
 
+void handle_server_alive(unsigned char *data, int size, maneater_client *cli) {
+    struct timeval tim;
+    gettimeofday(&tim, NULL);
+    cli->last_tick = tim.tv_sec;
+}
+
 int steady_network_input(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
     /* handle packets from network */
+    maneater_client *cli = (maneater_client *)arg;
+    zframe_t *incoming = zframe_recv(cli->local_socket);
+    unsigned char *data = zframe_data(incoming);
+    int size = zframe_size(incoming);
+    msgpack_unpacked msg;
+    size_t off;
+    MSG_NEXT(&msg, data, size, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_POSITIVE_INTEGER);
+    uint64_t msgid = msg.data.via.u64;
+
+    switch (msgid) {
+        case MID_S_ALIVE: handle_server_alive(data, size, cli); break;
+    }
 
     return 0;
 }
@@ -108,11 +126,11 @@ int master_pinger(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
 
     struct timeval tim;
     gettimeofday(&tim, NULL);
-    if (tim.tv_sec - cli->last_tick > MASTER_TIMEOUT)
+    if (tim.tv_sec - cli->last_tick > MASTER_TIMEOUT) {
+        zclock_log("MASTER TIMEOUT!\n");
         return -1;
+    }
 
-    printf("%s %s %p %p\n", cli->myhostid, cli->sessid,
-            cli->master_socket, cli->sockets[0]);
     MSG_DOPACK(
         msgpack_pack_int(pk, MID_C_ALIVE);
         MSG_PACK_STR(pk, cli->myhostid);
@@ -137,6 +155,11 @@ CLIENT_STATE steady_state(maneater_client * cli) {
 
     // after master is lost
     zloop_destroy(&mainloop);
+
+    free(cli->master);
+    cli->master = NULL;
+    cli->master_socket = NULL; // no master socket
+    cli->last_tick = 0;
 
     return CS_FINDMASTER;
 }
@@ -191,8 +214,7 @@ char *iface, char **hosts, int num_hosts) {
     cli->num_hosts = num_hosts;
     cli->hosts = (char **)malloc(sizeof(char *) * num_hosts);
     for (i=0; i < num_hosts; i++) {
-        cli->hosts[i] = (char *)malloc(strlen(hosts[i]) + 1);
-        strcpy(cli->hosts[i], hosts[i]);
+        COPY_STRING(cli->hosts[i], hosts[i]);
     }
 
     pthread_create(&(cli->thread), NULL, client_run_loop, (void *)cli);

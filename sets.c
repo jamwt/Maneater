@@ -49,6 +49,7 @@ typedef struct {
     stored_set *db;
     key_sub *subs;
     sublist *hostsockets;
+    void * master_socket;
 } set_state;
 
 static unsigned long long txid;
@@ -61,22 +62,25 @@ void set_init() {
     sstate.slaves = NULL;
     sstate.num_slaves = 0;
     sstate.db = NULL;
+    sstate.hostsockets = NULL;
+    sstate.subs = NULL;
 }
 
 sublist * check_subber_indexed(const char *host, int * added) {
-    sublist *subber;
+    sublist *subber = NULL;
     HASH_FIND_STR(sstate.hostsockets, host, subber);
-    
+
     *added = 0;
     if (!subber) {
         subber = (sublist *)malloc(sizeof (sublist));
-        subber->host = malloc(strlen(host));
-        strcpy(subber->host, host);
+        COPY_STRING(subber->host, host);
         *added = 1;
 
         subber->client_socket = zsocket_new(sstate.ctx, ZMQ_DEALER);
         zsocket_connect(subber->client_socket, "tcp://%s", host);
-        HASH_ADD_STR(sstate.hostsockets, host, subber);
+        MHASH_STRING_SET(sstate.hostsockets, host, subber);
+        HASH_FIND_STR(sstate.hostsockets, host, subber);
+        assert(subber);
     }
 
     return subber;
@@ -195,9 +199,7 @@ void handle_set_message(unsigned char * data, size_t len) {
             txid++;
             new = (stored_value *)malloc(sizeof(stored_value));
             if (lock) {
-                char *llock = malloc(strlen(lock));
-                strcpy(llock, lock);
-                new->lock = llock;
+                COPY_STRING(new->lock, lock);
             }
             else {
                 new->lock = NULL;
@@ -218,16 +220,12 @@ void handle_set_message(unsigned char * data, size_t len) {
     else {
         txid++;
         set = (stored_set *)malloc(sizeof(stored_set));
-        char *lkey = malloc(strlen(key));
-        strcpy(lkey, key);
-        set->key = lkey;
+        COPY_STRING(set->key, key);
         set->values = NULL;
 
         new = (stored_value *)malloc(sizeof(stored_value));
         if (lock) {
-            char *llock = malloc(strlen(lock));
-            strcpy(llock, lock);
-            new->lock = llock;
+            COPY_STRING(new->lock, lock);
         }
         else {
             new->lock = NULL;
@@ -287,8 +285,7 @@ void handle_follow_message(void * data, size_t len) {
 
         if (!subkey) {
             subkey = (key_sub *)malloc(sizeof(key_sub));
-            subkey->key = malloc(strlen(key));
-            strcpy(subkey->key, key);
+            COPY_STRING(subkey->key, key);
             subkey->subs = NULL;
         }
 
@@ -322,12 +319,30 @@ void start_master(zctx_t *ctx, consensus_host *slaves, int num_slaves) {
         map = (peer_map *)malloc(sizeof(peer_map));
         map->host = slaves[i].host;
         map->peer_socket = slaves[i].peer_socket;
-        HASH_ADD_STR(sstate.slaves, host, map);
-
+        MHASH_STRING_SET(sstate.slaves, host, map);
     }
 }
 
 void end_master(zctx_t *ctx) {
     sstate.role = ROLE_ELECTING;
+    sstate.ctx = NULL;
+
+    peer_map *map, *tmp;
+    HASH_ITER(hh, sstate.slaves, map, tmp) {
+        HASH_DEL(sstate.slaves, map);
+        free(map);
+    }
     sstate.slaves = NULL;
+}
+
+void start_slave(zctx_t *ctx, void *master_socket) {
+    sstate.role = ROLE_SLAVE;
+    sstate.ctx = ctx;
+    sstate.master_socket = master_socket;
+}
+
+void end_slave(zctx_t *ctx) {
+    sstate.role = ROLE_ELECTING;
+    sstate.ctx = NULL;
+    sstate.master_socket = NULL;
 }

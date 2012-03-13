@@ -68,6 +68,13 @@ void restart_election() {
         free(cstate.master);
         cstate.master = NULL;
     }
+
+    if (cstate.role == ROLE_MASTER) {
+        end_master(ctx);
+    }
+    else if (cstate.role == ROLE_SLAVE) {
+        end_slave(ctx);
+    }
     strcpy(cstate.advocating, myid);
     cstate.role = ROLE_ELECTING;
 
@@ -197,6 +204,44 @@ void handle_obey(unsigned char *data, int size) {
         cstate.master = (char *)malloc(strlen(host) + 1);
         strcpy(cstate.master, host);
         zclock_log("SLAVE (master = %s)", cstate.master);
+        int i;
+        void * master_socket = NULL;
+        for (i=1; i < num_hosts; i++) {
+            if (!strcmp(g_hosts[i].host, cstate.master)) {
+                    master_socket = g_hosts[i].peer_socket;
+                    break;
+            }
+        }
+
+        assert(master_socket);
+
+        start_slave(ctx, master_socket);
+    }
+}
+
+void handle_client_alive(unsigned char *data, int len) {
+    msgpack_unpacked msg;
+    size_t off;
+    zframe_t *out;
+
+    if (cstate.role == ROLE_MASTER) {
+        MSG_NEXT(&msg, data, len, &off);
+        assert(msg.data.type == MSGPACK_OBJECT_RAW);
+        const char *rethost = msg.data.via.raw.ptr;
+
+        MSG_NEXT(&msg, data, len, &off);
+        assert(msg.data.type == MSGPACK_OBJECT_RAW);
+        const char *sessid = msg.data.via.raw.ptr;
+        /* XXX call into sets to renew sessid locks */
+        (void)sessid;
+
+        MSG_DOPACK(
+            msgpack_pack_int(pk, MID_S_ALIVE);
+
+            out = zframe_new(buf->data, buf->size);
+        );
+
+        send_to_host(rethost, out);
     }
 }
 
@@ -246,6 +291,9 @@ int input_event(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
             break;
         case MID_WANT_MASTER:
             handle_want_master(data, size);
+            break;
+        case MID_C_ALIVE:
+            handle_client_alive(data, size);
             break;
         default:
             error_and_fail("unknown message id");
