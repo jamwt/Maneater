@@ -1,1 +1,1 @@
-rm -f *.o maneater
+rm -f *.o maneater CC test

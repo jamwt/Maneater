@@ -3,16 +3,10 @@
 #include "maneater.h"
 #include "uthash.h"
 #include "utlist.h"
-#include "tpl.h"
-
-typedef struct {
-    char *v;
-    int l;
-} bin;
 
 typedef struct stored_value {
     char *lock;
-    bin data;
+    msgpack_object_raw data;
 
     /* for utlist.h */
     struct stored_value *prev;
@@ -69,32 +63,56 @@ void set_init() {
     sstate.db = NULL;
 }
 
-void fire_update(stored_set *s, void *msock) {
-    zframe_t *template, *send;
-    tpl_node *tn;
-    tpl_bin tb;
-    int i, size;
-    void *dumped;
+sublist * check_subber_indexed(const char *host, int * added) {
+    sublist *subber;
+    HASH_FIND_STR(sstate.hostsockets, host, subber);
+    
+    *added = 0;
+    if (!subber) {
+        subber = (sublist *)malloc(sizeof (sublist));
+        subber->host = malloc(strlen(host));
+        strcpy(subber->host, host);
+        *added = 1;
 
-    tn = tpl_map(TPL_VALUE_MAP, s->key, s->txid, &tb);
-
-    tpl_pack(tn, 0);
-
-    for (i=0; i < s->num_values; i++) {
-        tb.addr = s->values[i].data.v;
-        tb.sz = s->values[i].data.l;
-        tpl_pack(tn, 1);
+        subber->client_socket = zsocket_new(sstate.ctx, ZMQ_DEALER);
+        zsocket_connect(subber->client_socket, "tcp://%s", host);
+        HASH_ADD_STR(sstate.hostsockets, host, subber);
     }
 
-    tpl_dump(tn, TPL_GETSIZE, &size);
-    dumped = (void *)malloc(size + 1);
-    ((char *)dumped)[0] = MID_VALUE;
+    return subber;
+}
 
-    tpl_dump(tn, TPL_MEM|TPL_PREALLOCD, dumped + 1, size);
 
-    tpl_free(tn);
+int send_to_host(const char *host, zframe_t *frame) {
+    int i;
+    sublist * subber = check_subber_indexed(host, &i);
 
-    template = zframe_new(dumped, size + 1);
+    assert(subber);
+
+    zframe_send(&frame, subber->client_socket, 0);
+
+    return i;
+}
+
+void fire_update(stored_set *s, void *msock) {
+    zframe_t *template, *send;
+    int i;
+
+    MSG_DOPACK(
+        msgpack_pack_int(pk, MID_VALUE);
+        MSG_PACK_STR(pk, s->key);
+        msgpack_pack_uint64(pk, s->txid);
+        msgpack_pack_array(pk, s->num_values);
+
+        for (i=0; i < s->num_values; i++) {
+            msgpack_pack_raw(pk, s->values[i].data.size);
+            msgpack_pack_raw_body(pk,
+                s->values[i].data.ptr,
+                s->values[i].data.size);
+        }
+
+        template = zframe_new(buf->data, buf->size);
+    );
 
     if (msock) {
         send = zframe_dup(template);
@@ -121,24 +139,51 @@ void fire_update(stored_set *s, void *msock) {
         }
     }
 
-    free(dumped);
     zframe_destroy(&template);
 }
 
-void handle_set_message(void * msg, size_t len) {
+void handle_set_message(unsigned char * data, size_t len) {
     if (sstate.role != ROLE_MASTER)
         return; // only the master can handle set messages
 
-    tpl_node * tn;
-    char *host = NULL;
-    char *key = NULL;
-    char *lock = NULL;
-    unsigned short limit;
-    tpl_bin tb;
+    size_t off;
 
-    tn = tpl_map(TPL_SET_MAP, host, key, lock, &limit, &tb);
-    tpl_load(tn, TPL_MEM, msg, len);
-    tpl_unpack(tn, 0);
+    const char *host = NULL;
+    const char *key = NULL;
+    const char *lock = NULL;
+    msgpack_object_raw *value = NULL;
+
+
+    msgpack_unpacked msg;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    host = msg.data.via.raw.ptr;
+    (void)host; // unused for now
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    key = msg.data.via.raw.ptr;
+
+    MSG_NEXT(&msg, data, len, &off);
+    switch (msg.data.type) {
+        case MSGPACK_OBJECT_RAW:
+            lock = msg.data.via.raw.ptr;
+            break;
+        case MSGPACK_OBJECT_NIL:
+            lock = NULL;
+            break;
+        default:
+            assert(0);
+    }
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_POSITIVE_INTEGER);
+    uint64_t limit = msg.data.via.u64;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    value = &msg.data.via.raw;
 
     stored_set *set;
     stored_value *new;
@@ -146,57 +191,57 @@ void handle_set_message(void * msg, size_t len) {
     HASH_FIND_STR(sstate.db, key, set);
 
     if (set) {
-        if (limit && set->num_values >= limit) {
-            goto all_unused;
-        }
-        else {
+        if (!limit || set->num_values < limit) {
             txid++;
             new = (stored_value *)malloc(sizeof(stored_value));
-            new->lock = lock;
-            new->data.v = tb.addr;
-            new->data.l = tb.sz;
+            if (lock) {
+                char *llock = malloc(strlen(lock));
+                strcpy(llock, lock);
+                new->lock = llock;
+            }
+            else {
+                new->lock = NULL;
+            }
+
+            new->data.ptr = malloc(value->size);
+            memcpy((void *)new->data.ptr, value->ptr, value->size);
+            new->data.size = value->size;
 
             set->num_values++;
             set->txid = txid;
             LL_APPEND(set->values, new);
 
             fire_update(set, NULL);
-
-            goto key_unused;
         }
 
     }
     else {
         txid++;
         set = (stored_set *)malloc(sizeof(stored_set));
-        set->key = key;
+        char *lkey = malloc(strlen(key));
+        strcpy(lkey, key);
+        set->key = lkey;
         set->values = NULL;
 
         new = (stored_value *)malloc(sizeof(stored_value));
-        new->lock = lock;
-        new->data.v = tb.addr;
-        new->data.l = tb.sz;
+        if (lock) {
+            char *llock = malloc(strlen(lock));
+            strcpy(llock, lock);
+            new->lock = llock;
+        }
+        else {
+            new->lock = NULL;
+        }
+        new->data.ptr = malloc(value->size);
+        memcpy((void *)new->data.ptr, value->ptr, value->size);
+        new->data.size = value->size;
 
         set->num_values++;
         set->txid = txid;
         LL_APPEND(set->values, new);
 
         fire_update(set, NULL);
-
-        goto final_free;
     }
-
-all_unused:
-    if (lock)
-        free(lock);
-
-key_unused:
-    free(key);
-
-final_free:
-
-    free(host);
-    tpl_free(tn);
 }
 
 typedef struct {
@@ -204,46 +249,47 @@ typedef struct {
     unsigned long long txid;
 } follow_pair;
 
-void handle_follow_message(void * msg, size_t len) {
-    tpl_node * tn;
-    char connbuf[150] = {0};
-    int used_host = 0;
+void handle_follow_message(void * data, size_t len) {
+    int person_added = 0;
 
-    char *host = NULL;
-    follow_pair pair;
+    const char *host = NULL;
+    uint64_t txid; 
+    msgpack_unpacked msg;
+    size_t off;
+    const char *key;
 
-    tn = tpl_map(TPL_FOLLOW_MAP, host, &pair);
-    tpl_load(tn, TPL_MEM, msg, len);
-    tpl_unpack(tn, 0);
-    
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    host = msg.data.via.raw.ptr;
+
     key_sub *subkey;
-    sublist *subber;
+    sublist *subber = check_subber_indexed(host, &person_added);
 
-    HASH_FIND_STR(sstate.hostsockets, host, subber);
-    
-    if (!subber) {
-        subber = (sublist *)malloc(sizeof (sublist));
-        subber->host = host;
-        used_host = 1;
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_ARRAY);
+    int count = msg.data.via.array.size;
 
-        subber->client_socket = zsocket_new(sstate.ctx, ZMQ_DEALER);
-        snprintf(connbuf, sizeof(connbuf), "tcp://%s", host);
-        zsocket_connect(subber->client_socket, connbuf);
-        HASH_ADD_STR(sstate.hostsockets, host, subber);
-    }
+    int i = 0;
 
-    while (tpl_unpack(tn, 1) > 0) {
+    for (i=0; i < count; i++) {
         /* for each subscription, make sure it's added
          * and broadcast an update if it's out of sync */
-        HASH_FIND_STR(sstate.subs, pair.key, subkey);
+        msgpack_object * obj = &msg.data.via.array.ptr[i];
+        assert(obj->type == MSGPACK_OBJECT_RAW);
+        key = obj->via.raw.ptr;
+        i++;
+
+        obj = &msg.data.via.array.ptr[i];
+        assert(obj->type == MSGPACK_OBJECT_POSITIVE_INTEGER);
+        txid = obj->via.u64;
+
+        HASH_FIND_STR(sstate.subs, key, subkey);
 
         if (!subkey) {
             subkey = (key_sub *)malloc(sizeof(key_sub));
-            subkey->key = pair.key;
+            subkey->key = malloc(strlen(key));
+            strcpy(subkey->key, key);
             subkey->subs = NULL;
-        }
-        else {
-            free(pair.key); // don't need this copy of the key
         }
 
         sublist *app;
@@ -251,19 +297,18 @@ void handle_follow_message(void * msg, size_t len) {
         if (!app) {
             /* need a copy for the HT */
             app = (sublist *)malloc(sizeof(sublist));
+
+            /* NOTE -- pointer to host char * and 
+             * socket char * is copied here */
             memcpy(app, subber, sizeof(sublist));
             HASH_ADD_STR(subkey->subs, host, app);
         }
 
         stored_set *ss;
-        HASH_FIND_STR(sstate.db, pair.key, ss);
-        if (ss && ss->txid != pair.txid)
+        HASH_FIND_STR(sstate.db, key, ss);
+        if (ss && ss->txid != txid)
             fire_update(ss, subber->client_socket);
     }
-
-    if (!used_host)
-        free(host);
-    tpl_free(tn);
 }
 
 void start_master(zctx_t *ctx, consensus_host *slaves, int num_slaves) {

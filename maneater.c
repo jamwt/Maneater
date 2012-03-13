@@ -15,23 +15,12 @@ typedef struct {
 
 #define ELECTION_RESET_TIMEOUT 5
 typedef struct {
-    char master[NODEID_LEN];
+    char * master;
     char advocating[NODEID_LEN];
     unsigned int reset_timer;
     ROLE role;
     my_advocate *myads;
 } consensus_state;
-
-typedef struct {
-    char msgtype;
-    char nodeid[NODEID_LEN];
-    char advocating[NODEID_LEN];
-} message_advocate;
-
-typedef struct {
-    char msgtype;
-    char nodeid[NODEID_LEN];
-} message_obey;
 
 enum {
     MID_ADVOCATE,
@@ -65,14 +54,20 @@ void handle_args(int argc, char **argv) {
     g_hosts = (consensus_host *)malloc(num_hosts * sizeof(consensus_host));
 
     for (i=0; i < num_hosts; i++) {
-        g_hosts[i].host = argv[i + 1];
+        char * h = argv[i + 1];
+        if (strlen(h) >= HOSTID_LEN - 10)
+            error_and_fail("host identifier too long");
+        g_hosts[i].host = h;
     }
 }
 
 void restart_election() {
     zclock_log("{election_runner} (RE)START");
     cstate.reset_timer = 0xffffffff;
-    cstate.master[0] = '\0';
+    if (cstate.master) {
+        free(cstate.master);
+        cstate.master = NULL;
+    }
     strcpy(cstate.advocating, myid);
     cstate.role = ROLE_ELECTING;
 
@@ -85,23 +80,20 @@ void restart_election() {
 
 void setup_zeromq() {
     int i, conn_succ;
-    char connbuf[150] = {0};
     ctx = zctx_new();
 
     /* setup local bind */
     consensus_host *h = &(g_hosts[0]); // convention: I am the first
     local_socket = zsocket_new(ctx, ZMQ_DEALER);
-    snprintf(connbuf, sizeof(connbuf), "tcp://%s", h->host);
 
     /* Note: no checking for error here b/c czmq will assert on invalid bind */
-    conn_succ = zsocket_bind(local_socket, connbuf);
+    conn_succ = zsocket_bind(local_socket, "tcp://%s", h->host);
 
     /* setup peer connections (including to myself) */
     for (i=0; i < num_hosts; i++) {
         h = g_hosts + i;
         h->peer_socket = zsocket_new(ctx, ZMQ_DEALER);
-        snprintf(connbuf, sizeof(connbuf), "tcp://%s", h->host);
-        conn_succ = zsocket_connect(h->peer_socket, connbuf);
+        conn_succ = zsocket_connect(h->peer_socket, "tcp://%s", h->host);
         if (conn_succ != 0) {
             snprintf(errbuf, ERRBUF_SZ - 1, "invalid peer specification (%s)", h->host);
             error_and_fail(errbuf);
@@ -127,22 +119,43 @@ void test_for_master() {
     if (HASH_COUNT(cstate.myads) >= quorum_amt) {
         zclock_log("MASTER");
         cstate.role = ROLE_MASTER;
+        consensus_host * hosts;
+        cstate.master = (char *)malloc(strlen(g_hosts[0].host) + 1);
+        strcpy(cstate.master, g_hosts[0].host);
+        if (num_hosts == 1)
+            hosts = NULL;
+        else
+            hosts = &(g_hosts[1]);
+
+        start_master(ctx, hosts, num_hosts - 1);
     }
 }
 
-void handle_advocate(message_advocate *ad) {
+void handle_advocate(unsigned char* data, int size) {
+    msgpack_unpacked msg;
+    size_t off;
+
+    MSG_NEXT(&msg, data, size, &off);
+    msgpack_object_print(stderr, msg.data);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    char *nodeid = (char *)msg.data.via.raw.ptr;
+
+    MSG_NEXT(&msg, data, size, &off);
+    msgpack_object_print(stderr, msg.data);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    char *advocating = (char *)msg.data.via.raw.ptr;
 
     // we haven't given up on the master yet?
     if (cstate.role != ROLE_ELECTING)
         return;
 
-    zclock_log("got advocation: %s vs. %s", ad->advocating, cstate.advocating);
+    zclock_log("got advocation: %s vs. %s", advocating);
 
     /* 1. If this is LOWER than my current advocating value
      * I advocate for it now */
-    if (strcmp(ad->advocating, cstate.advocating) < 0) {
-        zclock_log("changing advocation: %s -> %s", cstate.advocating, ad->advocating);
-        strcpy(cstate.advocating, ad->advocating);
+    if (strcmp(advocating, cstate.advocating) < 0) {
+        zclock_log("changing advocation: %s -> %s", cstate.advocating, advocating);
+        strcpy(cstate.advocating, advocating);
         struct timeval tim;
         gettimeofday(&tim, NULL);
         cstate.reset_timer = tim.tv_sec + ELECTION_RESET_TIMEOUT;
@@ -151,49 +164,88 @@ void handle_advocate(message_advocate *ad) {
     /* 2. If this node is me, then add this to my set
      * of advocates; if I get a quorum, declare myself
      * master */
-    
+
     my_advocate * fad;
 
-    if (! strcmp(ad->advocating, myid) ) {
-        HASH_FIND_STR(cstate.myads, ad->nodeid, fad);
+    if (! strcmp(advocating, myid) ) {
+        HASH_FIND_STR(cstate.myads, nodeid, fad);
         if (! fad) {
-            zclock_log("new advocate for me: %s", ad->nodeid);
+            zclock_log("new advocate for me: %s", nodeid);
             fad = malloc(sizeof(my_advocate));
-            strcpy(fad->nodeid, ad->nodeid);
+            strcpy(fad->nodeid, nodeid);
             HASH_ADD_STR(cstate.myads, nodeid, fad);
             test_for_master();
         }
     }
 }
 
-void handle_obey(message_obey * ob) {
+void handle_obey(unsigned char *data, int size) {
+    msgpack_unpacked msg;
+    msgpack_unpacked_init(&msg);
+    size_t off;
+
+    MSG_NEXT(&msg, data, size, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    char *host = (char *)msg.data.via.raw.ptr;
+
     struct timeval tim;
     gettimeofday(&tim, NULL);
     cstate.reset_timer = tim.tv_sec + ELECTION_RESET_TIMEOUT;
 
     if (cstate.role == ROLE_ELECTING) {
         cstate.role = ROLE_SLAVE;
-        strcpy(cstate.master, ob->nodeid);
+        cstate.master = (char *)malloc(strlen(host) + 1);
+        strcpy(cstate.master, host);
         zclock_log("SLAVE (master = %s)", cstate.master);
     }
+}
 
+void handle_want_master(unsigned char *data, int len) {
+    msgpack_unpacked msg;
+    size_t off;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    const char *host = msg.data.via.raw.ptr;
+    zframe_t *out;
+
+    if (cstate.role != ROLE_ELECTING) {
+        MSG_DOPACK(
+            msgpack_pack_int(pk, MID_IS_MASTER);
+            MSG_PACK_STR(pk, cstate.master);
+
+            out = zframe_new(buf->data, buf->size);
+        );
+
+        send_to_host(host, out);
+    }
 }
 
 int input_event(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
 
     zframe_t *incoming = zframe_recv(local_socket);
     unsigned char *data = zframe_data(incoming);
-    unsigned char msgid = data[0];
+    int size = zframe_size(incoming);
+    size_t off;
+
+    msgpack_unpacked msg;
+    msgpack_unpacked_init(&msg);
+    MSG_NEXT(&msg, data, size, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_POSITIVE_INTEGER);
+    uint64_t msgid = msg.data.via.u64;
 
     switch (msgid) {
         case MID_ADVOCATE:
-            handle_advocate((message_advocate *)data);
+            handle_advocate(data, size);
             break;
         case MID_OBEY:
-            handle_obey((message_obey *)data);
+            handle_obey(data, size);
             break;
         case MID_SET:
-            handle_set_message(data + 1, zframe_size(incoming) - 1);
+            handle_set_message(data, size);
+            break;
+        case MID_WANT_MASTER:
+            handle_want_master(data, size);
             break;
         default:
             error_and_fail("unknown message id");
@@ -207,14 +259,18 @@ int master_alive(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
     struct timeval tim;
     int x;
     gettimeofday(&tim, NULL);
+    zframe_t * frame;
     if (tim.tv_sec >= cstate.reset_timer)
         restart_election();
     
     if (cstate.role == ROLE_MASTER) {
-        message_obey m;
-        m.msgtype = MID_OBEY;
-        strcpy(m.nodeid, myid);
-        zframe_t * frame = zframe_new((char *)&m, sizeof(m));
+        MSG_DOPACK(
+        msgpack_pack_int(pk, MID_OBEY);
+        MSG_PACK_STR(pk, g_hosts[0].host);
+
+        frame = zframe_new(
+            buf->data, buf->size);
+        );
 
         for (x=0; x < num_hosts; x++) {
             zframe_t * sendframe = zframe_dup(frame);
@@ -231,12 +287,17 @@ int election_runner(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
     if (cstate.role != ROLE_ELECTING)
         return 0;
     int x;
+    zframe_t * frame;
     zclock_log("{election_runner} advocating for %s", cstate.advocating);
-    message_advocate m;
-    m.msgtype = MID_ADVOCATE;
-    strcpy(m.nodeid, myid);
-    strcpy(m.advocating, cstate.advocating);
-    zframe_t * frame = zframe_new((char *)&m, sizeof(m));
+
+    MSG_DOPACK(
+        msgpack_pack_int(pk, MID_ADVOCATE);
+        MSG_PACK_STR(pk, myid);
+        MSG_PACK_STR(pk, cstate.advocating);
+
+        frame = zframe_new(buf->data, buf->size);
+    );
+
     for (x=0; x < num_hosts; x++) {
         zframe_t * sendframe = zframe_dup(frame);
         zframe_send(&sendframe, g_hosts[x].peer_socket, 0);
@@ -254,15 +315,4 @@ void loop() {
     zloop_timer(mainloop, 1000, 0, election_runner, NULL);
     zloop_timer(mainloop, 1000, 0, master_alive, NULL);
     zloop_start(mainloop);
-}
-
-int main (int argc, char **argv) {
-    handle_args(argc, argv);
-    setup_node_state();
-    set_init();
-    setup_zeromq();
-
-    loop();
-
-    return 0;
 }
