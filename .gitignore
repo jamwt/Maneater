@@ -1,0 +1,7 @@
+.redo/
+*.o
+CC
+*.a
+*.so.*
+maneater
+test
