@@ -289,6 +289,12 @@ int input_event(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
         case MID_SET:
             handle_set_message(data, size);
             break;
+        case MID_GET:
+            handle_get_message(data, size);
+            break;
+        case MID_DEL:
+            handle_del_message(data, size);
+            break;
         case MID_FOLLOW:
             handle_follow_message(data, size);
             break;

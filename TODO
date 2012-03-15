@@ -1,2 +1,10 @@
- * Change socket type or use NOBLOCK to prevent blocking?
- * favor a slave for subs
+ [ ] timeouts remove locks (and lock tracking)
+ [ ] get * boundaries
+ [ ] slave sync (get *)
+ [ ] ensure slave sub relay works correctly (value handling)
+ [ ] client sockets get closed/killed if no activity
+     in N seconds
+ [ ] favor a slave for subs
+ [ ] client clean finalization (free() etc on early cluster death)
+
+ [?] Change socket type or use NOBLOCK to prevent blocking?

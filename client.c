@@ -17,7 +17,9 @@ typedef enum {
 
 enum {
     PROC_MID_SUB,
-    PROC_MID_SET
+    PROC_MID_SET,
+    PROC_MID_GET,
+    PROC_MID_DEL,
 };
 
 typedef struct {
@@ -25,11 +27,23 @@ typedef struct {
 } proc_message_sub;
 
 typedef struct {
+    char *key;
+} proc_message_get;
+
+typedef struct {
+    char *key;
+    void *value;
+    int value_length;
+} proc_message_del;
+
+typedef struct {
     int mid;
 
     union data {
         proc_message_sub sub;
         proc_message_set set;
+        proc_message_get get;
+        proc_message_del del;
     } via;
 } proc_message;
 
@@ -156,6 +170,7 @@ void handle_value(unsigned char *data, int size, maneater_client *cli) {
     printf("%s %d\n", key, (int)txid);
 
     MSG_NEXT(&msg, data, size, &off);
+    printf("%d\n", msg.data.type);
     assert(msg.data.type == MSGPACK_OBJECT_ARRAY);
 
     int i = 0, count = msg.data.via.array.size;
@@ -318,6 +333,46 @@ void handle_set(maneater_client *cli, proc_message_set *set) {
     }
 }
 
+void handle_get(maneater_client *cli, proc_message_get *get) {
+    zframe_t *out;
+
+    MSG_DOPACK(
+        msgpack_pack_int(pk, MID_GET);
+        MSG_PACK_STR(pk, cli->myhostid);
+        MSG_PACK_STR(pk, get->key);
+
+        out = zframe_new(buf->data, buf->size);
+    );
+
+    zframe_send(&out, cli->master_socket, 0);
+
+    free(get->key);
+}
+
+void handle_del(maneater_client *cli, proc_message_del *del) {
+    zframe_t *out;
+
+    MSG_DOPACK(
+        msgpack_pack_int(pk, MID_DEL);
+        MSG_PACK_STR(pk, del->key);
+        if (del->value) {
+            msgpack_pack_raw(pk, del->value_length);
+            msgpack_pack_raw_body(pk, del->value, del->value_length);
+        }
+        else
+            msgpack_pack_nil(pk);
+
+        out = zframe_new(buf->data, buf->size);
+    );
+
+    zframe_send(&out, cli->master_socket, 0);
+
+    free(del->key);
+
+    if (del->value)
+        free(del->value);
+}
+
 int steady_inproc_input(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
     maneater_client *cli = (maneater_client *)arg;
     zframe_t *incoming = zframe_recv(cli->proc_socket);
@@ -325,6 +380,8 @@ int steady_inproc_input(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
     switch (msg->mid) {
         case PROC_MID_SUB: handle_sub(cli, &(msg->via.sub)); break;
         case PROC_MID_SET: handle_set(cli, &(msg->via.set)); break;
+        case PROC_MID_GET: handle_get(cli, &(msg->via.get)); break;
+        case PROC_MID_DEL: handle_del(cli, &(msg->via.del)); break;
         default: assert(0);
     }
 
@@ -461,6 +518,34 @@ void maneater_client_set(maneater_client * cli,
     s->value_length = value_length;
     s->lock = lock;
     s->limit = limit;
+
+    CLIENT_INPROC_SEND(cli, msg);
+}
+
+void maneater_client_get(maneater_client * cli, 
+        const char *key
+        ) {
+    proc_message msg;
+    msg.mid = PROC_MID_GET;
+    COPY_STRING(msg.via.get.key, key);
+
+    CLIENT_INPROC_SEND(cli, msg);
+}
+
+void maneater_client_del(maneater_client * cli, 
+        const char *key,
+        char *value,
+        int value_length
+        ) {
+    proc_message msg;
+    msg.mid = PROC_MID_DEL;
+    COPY_STRING(msg.via.del.key, key);
+    if (value) {
+        COPY_STRING(msg.via.del.value, value);
+        msg.via.del.value_length = value_length;
+    }
+    else
+        msg.via.del.value = NULL;
 
     CLIENT_INPROC_SEND(cli, msg);
 }

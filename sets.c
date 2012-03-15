@@ -40,6 +40,12 @@ typedef struct {
     UT_hash_handle hh;
 } key_sub;
 
+typedef struct {
+    char *lock;
+    char *key;
+
+    UT_hash_handle hh;
+} lock_sub;
 
 typedef struct {
     ROLE role;
@@ -49,6 +55,7 @@ typedef struct {
     stored_set *db;
     key_sub *subs;
     sublist *hostsockets;
+    sublist *locksets;
     void * master_socket;
 } set_state;
 
@@ -63,6 +70,7 @@ void set_init() {
     sstate.num_slaves = 0;
     sstate.db = NULL;
     sstate.hostsockets = NULL;
+    sstate.locksets = NULL;
     sstate.subs = NULL;
 }
 
@@ -107,6 +115,7 @@ void fire_update(stored_set *s, void *msock) {
         MSG_PACK_STR(pk, s->key);
         msgpack_pack_uint64(pk, s->txid);
         msgpack_pack_array(pk, s->num_values);
+        printf("values? %d\n", s->num_values);
 
         stored_value *val = NULL;
         for (val = s->values; val; val = val->next) {
@@ -148,6 +157,107 @@ void fire_update(stored_set *s, void *msock) {
     zframe_destroy(&template);
 }
 
+void handle_get_message(unsigned char * data, size_t len) {
+    size_t off;
+
+    const char *host = NULL;
+    const char *key = NULL;
+
+    msgpack_unpacked msg;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    host = msg.data.via.raw.ptr;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    key = msg.data.via.raw.ptr;
+
+    int l = strlen(key);
+    int person_added;
+    stored_set *s, tmp;
+    sublist *subber = check_subber_indexed(host, &person_added);
+    assert(subber);
+
+    int nl = l - 1;
+    if (key[nl] == '*') {
+        char *tkey;
+        COPY_STRING(tkey, key);
+        tkey[nl] = 0;
+
+        for (s=sstate.db; s; s = s->hh.next) {
+            /* NOTE: nl == 0 is '*' case */
+            if (strlen(s->key) >= nl
+                && (nl == 0 || !strncmp(s->key, tkey, nl))) {
+                fire_update(s, subber->client_socket);
+            }
+        }
+
+        free(tkey);
+    }
+    else {
+        HASH_FIND_STR(sstate.db, key, s);
+        if (!s) {
+            tmp.key = (char *)key;
+            tmp.values = NULL;
+            tmp.txid = 0;
+            tmp.num_values = 0;
+            s = &tmp;
+        }
+
+        fire_update(s, subber->client_socket);
+    }
+}
+
+void do_delete(const char *key, maneater_bin value) {
+    stored_set *s;
+    stored_value *v, *tmp;
+
+    HASH_FIND_STR(sstate.db, key, s);
+    if (s) {
+        txid++;
+        LL_FOREACH_SAFE(s->values, v, tmp) {
+            if (!value.ptr ||
+            BINARIES_EQUAL(value, v->data)) {
+                LL_DELETE(s->values, v);
+                free(v->data.ptr);
+                free(v);
+                s->num_values--;
+            }
+        }
+        s->txid = txid;
+        fire_update(s, NULL);
+    }
+}
+
+
+void handle_del_message(unsigned char * data, size_t len) {
+    size_t off;
+
+    const char *key = NULL;
+    maneater_bin value;
+
+    msgpack_unpacked msg;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    key = msg.data.via.raw.ptr;
+
+    MSG_NEXT(&msg, data, len, &off);
+    switch (msg.data.type) {
+        case MSGPACK_OBJECT_RAW: 
+            value.ptr = (void *) msg.data.via.raw.ptr;
+            value.size =  msg.data.via.raw.size;
+            break;
+        case MSGPACK_OBJECT_NIL: 
+            value.ptr = NULL;
+            value.size = 0;
+            break;
+        default: assert(0); /* unknown type next */
+    }
+    do_delete(key, value);
+}
+
 void handle_set_message(unsigned char * data, size_t len) {
     if (sstate.role != ROLE_MASTER)
         return; // only the master can handle set messages
@@ -157,8 +267,7 @@ void handle_set_message(unsigned char * data, size_t len) {
     const char *host = NULL;
     const char *key = NULL;
     const char *lock = NULL;
-    msgpack_object_raw *value = NULL;
-
+    maneater_bin value;
 
     msgpack_unpacked msg;
 
@@ -189,7 +298,8 @@ void handle_set_message(unsigned char * data, size_t len) {
 
     MSG_NEXT(&msg, data, len, &off);
     assert(msg.data.type == MSGPACK_OBJECT_RAW);
-    value = &msg.data.via.raw;
+    value.ptr = (void *)msg.data.via.raw.ptr;
+    value.size = msg.data.via.raw.size;
 
     stored_set *set;
     stored_value *new;
@@ -198,6 +308,10 @@ void handle_set_message(unsigned char * data, size_t len) {
 
     if (set) {
         if (!limit || set->num_values < limit) {
+            for (new = set->values; new; new = new->next) {
+                if (BINARIES_EQUAL(new->data, value))
+                    return; /* set!  don't duplicate */
+            }
             txid++;
             new = (stored_value *)malloc(sizeof(stored_value));
             if (lock) {
@@ -207,8 +321,8 @@ void handle_set_message(unsigned char * data, size_t len) {
                 new->lock = NULL;
             }
 
-            COPY_MEM(new->data.ptr, value->ptr, value->size);
-            new->data.size = value->size;
+            COPY_MEM(new->data.ptr, value.ptr, value.size);
+            new->data.size = value.size;
 
             set->num_values++;
             set->txid = txid;
@@ -231,10 +345,10 @@ void handle_set_message(unsigned char * data, size_t len) {
         else {
             new->lock = NULL;
         }
-        COPY_MEM(new->data.ptr, value->ptr, value->size);
-        new->data.size = value->size;
+        COPY_MEM(new->data.ptr, value.ptr, value.size);
+        new->data.size = value.size;
 
-        set->num_values++;
+        set->num_values = 1;
         set->txid = txid;
         LL_APPEND(set->values, new);
 

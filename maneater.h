@@ -43,9 +43,13 @@ int send_to_host(const char *host, zframe_t *frame);
 void set_init();
 void handle_set_message(unsigned char * data, size_t len);
 void handle_follow_message(unsigned char * data, size_t len);
+void handle_get_message(unsigned char * data, size_t len);
+void handle_del_message(unsigned char * data, size_t len);
 
 enum {
     MID_SET = 100,
+    MID_GET,
+    MID_DEL,
     MID_FOLLOW,
     MID_VALUE,
     MID_WANT_MASTER,
@@ -127,6 +131,16 @@ void maneater_client_set(maneater_client * cli,
         uint64_t limit
         );
 
+void maneater_client_get(maneater_client * cli, 
+        const char *key
+        );
+
+void maneater_client_del(maneater_client * cli, 
+        const char *key,
+        char *value,
+        int value_length
+        );
+
 /* XXX unsub */
 
 
@@ -178,5 +192,11 @@ void maneater_client_set(maneater_client * cli,
 #define MHASH_STRING_SET(h, f, o) ({\
     HASH_ADD_KEYPTR(hh, h, o->f, strlen(o->f), o);\
     })
+
+#define BINARIES_EQUAL(b1, b2) (\
+    b1.size == b2.size &&\
+     !memcmp(b1.ptr, b2.ptr, b1.size)\
+    )
+    
 
 #endif /* MANEATER_H */
