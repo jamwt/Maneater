@@ -98,6 +98,7 @@ int master_finder(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
 
     MSG_DOPACK(
         msgpack_pack_int(pk, MID_WANT_MASTER);
+        MSG_PACK_STR(pk, cli->sessid);
         MSG_PACK_STR(pk, cli->myhostid);
         out = zframe_new(buf->data, buf->size);
     );
@@ -251,8 +252,8 @@ int master_pinger(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
 
     MSG_DOPACK(
         msgpack_pack_int(pk, MID_C_ALIVE);
-        MSG_PACK_STR(pk, cli->myhostid);
         MSG_PACK_STR(pk, cli->sessid);
+        MSG_PACK_STR(pk, cli->myhostid);
 
         out = zframe_new(buf->data, buf->size);
     );
@@ -271,6 +272,7 @@ void send_updated_follow_list(maneater_client *cli) {
 
     MSG_DOPACK(
         msgpack_pack_int(pk, MID_FOLLOW);
+        MSG_PACK_STR(pk, cli->sessid);
         MSG_PACK_STR(pk, cli->myhostid);
         msgpack_pack_array(pk, num_follows * 2);
 
@@ -338,6 +340,7 @@ void handle_get(maneater_client *cli, proc_message_get *get) {
 
     MSG_DOPACK(
         msgpack_pack_int(pk, MID_GET);
+        MSG_PACK_STR(pk, cli->sessid);
         MSG_PACK_STR(pk, cli->myhostid);
         MSG_PACK_STR(pk, get->key);
 

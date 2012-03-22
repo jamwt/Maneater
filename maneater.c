@@ -227,13 +227,13 @@ void handle_client_alive(unsigned char *data, int len) {
     if (cstate.role == ROLE_MASTER) {
         MSG_NEXT(&msg, data, len, &off);
         assert(msg.data.type == MSGPACK_OBJECT_RAW);
-        const char *rethost = msg.data.via.raw.ptr;
+        const char *sessionid = msg.data.via.raw.ptr;
 
         MSG_NEXT(&msg, data, len, &off);
         assert(msg.data.type == MSGPACK_OBJECT_RAW);
-        const char *sessid = msg.data.via.raw.ptr;
-        /* XXX call into sets to renew sessid locks */
-        (void)sessid;
+        const char *rethost = msg.data.via.raw.ptr;
+
+        touch_session(sessionid);
 
         MSG_DOPACK(
             msgpack_pack_int(pk, MID_S_ALIVE);
@@ -241,13 +241,17 @@ void handle_client_alive(unsigned char *data, int len) {
             out = zframe_new(buf->data, buf->size);
         );
 
-        send_to_host(rethost, out);
+        send_to_session(sessionid, rethost, out);
     }
 }
 
 void handle_want_master(unsigned char *data, int len) {
     msgpack_unpacked msg;
     size_t off;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    const char *sessionid = msg.data.via.raw.ptr;
 
     MSG_NEXT(&msg, data, len, &off);
     assert(msg.data.type == MSGPACK_OBJECT_RAW);
@@ -262,7 +266,7 @@ void handle_want_master(unsigned char *data, int len) {
             out = zframe_new(buf->data, buf->size);
         );
 
-        send_to_host(host, out);
+        send_to_session(sessionid, host, out);
     }
 }
 
@@ -371,5 +375,7 @@ void loop() {
     zloop_poller(mainloop, &bind_input, input_event, NULL);
     zloop_timer(mainloop, 1000, 0, election_runner, NULL);
     zloop_timer(mainloop, 1000, 0, master_alive, NULL);
+    /* in the set code, check sessions if we're master */
+    zloop_timer(mainloop, 5000, 0, check_expired_sessions, NULL);
     zloop_start(mainloop);
 }

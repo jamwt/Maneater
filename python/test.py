@@ -103,7 +103,9 @@ if __name__ == '__main__':
         def handle_value_changed(self, key, values, acquired):
             print "Changed: %s(%s) %r" % (key, acquired, values)
 
-    import time
+    import time, os
+    pid = str(os.getpid())
+    print "id =", pid
 
     c = MyManeaterCluster("127.0.0.1", 
             ["127.0.0.1:4441",
@@ -113,21 +115,22 @@ if __name__ == '__main__':
 
     c.subscribe("foo")
     time.sleep(4)
-    c.set("foo", "baz", limit=1)
-    c.set("fire", "boast", limit=1)
-    time.sleep(4)
-    c.get("foo")
-    time.sleep(4)
-    c.get("f*")
-    time.sleep(4)
-    c.get("*")
-    time.sleep(4)
-    print "DELETE FIRE?"
-    c.delete("fire", "boast")
-    time.sleep(4)
-    c.delete("fire")
+    c.set("foo", pid, session=True, limit=1)
+    time.sleep(28)
+    #c.set("fire", "boast", limit=1)
+    #time.sleep(4)
+    #c.get("foo")
+    #time.sleep(4)
+    #c.get("f*")
+    #time.sleep(4)
+    #c.get("*")
+    #time.sleep(4)
+    #print "DELETE FIRE?"
+    #c.delete("fire", "boast")
+    #time.sleep(4)
+    #c.delete("fire")
 
-    time.sleep(25)
+    #time.sleep(25)
 
     del MyManeaterCluster
 

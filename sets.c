@@ -4,8 +4,15 @@
 #include "uthash.h"
 #include "utlist.h"
 
+/* Represents the actual stored
+ * value in the database; it's a LL
+ * b/c it's a series of items;
+ * optionally, the stored_value is
+ * tied to a specific client session
+ * which may timeout
+ */
 typedef struct stored_value {
-    char *lock;
+    void *owner; /* sessionid or NULL */
     maneater_bin data;
 
     /* for utlist.h */
@@ -13,6 +20,9 @@ typedef struct stored_value {
     struct stored_value *next;
 } stored_value;
 
+/* Represents the set of stored items
+ * for a given key in the db
+ */
 typedef struct {
     char * key;
     stored_value * values;
@@ -21,32 +31,45 @@ typedef struct {
     UT_hash_handle hh;
 } stored_set;
 
+/* Hostname to socket map for slaves (NOT clients)
+ */
 typedef struct {
     char *host;
     void *peer_socket;
     UT_hash_handle hh;
 } peer_map;
 
-typedef struct sublist {
-    void *client_socket;
-    char *host;
+/* A key (within the list of keys) that a particular
+ * client/session is subscribed to*/
+typedef struct keyset {
+    char *key;
 
     UT_hash_handle hh;
-} sublist;
+} keyset;
 
+/* A session (that represents a running instance of
+ * a client); includes the socket to that client as
+ * well as the list of keys to which this client is
+ * subscribed.  The last timestamp for ALIVE is tracked
+ * as well for session timeout purposes. */
+typedef struct {
+    char *sessionid;
+    uint32_t tick;
+    void *client_socket;
+
+    keyset * subs;
+    keyset * owns;
+    UT_hash_handle hh;
+} session;
+
+/* The list of subscribing sessions for a db _KEY_ */
 typedef struct {
     char *key;
-    sublist *subs;
+    session *sessions;
     UT_hash_handle hh;
 } key_sub;
 
-typedef struct {
-    char *lock;
-    char *key;
-
-    UT_hash_handle hh;
-} lock_sub;
-
+/* The state of the entire set database */
 typedef struct {
     ROLE role;
     zctx_t *ctx;
@@ -54,8 +77,7 @@ typedef struct {
     int num_slaves;
     stored_set *db;
     key_sub *subs;
-    sublist *hostsockets;
-    sublist *locksets;
+    session *sessions;
     void * master_socket;
 } set_state;
 
@@ -69,41 +91,119 @@ void set_init() {
     sstate.slaves = NULL;
     sstate.num_slaves = 0;
     sstate.db = NULL;
-    sstate.hostsockets = NULL;
-    sstate.locksets = NULL;
+
+    /* key -> sessions which subscribe */
     sstate.subs = NULL;
+
+    /* session id -> session */
+    sstate.sessions = NULL;
 }
 
-sublist * check_subber_indexed(const char *host, int * added) {
-    sublist *subber = NULL;
-    HASH_FIND_STR(sstate.hostsockets, host, subber);
+/* forward declaration, defined lower in file */
+void do_delete(const char *key, maneater_bin value, session *owner);
 
-    *added = 0;
-    if (!subber) {
-        subber = (sublist *)malloc(sizeof (sublist));
-        COPY_STRING(subber->host, host);
-        *added = 1;
+void touch_session(const char *sessionid) {
+    struct timeval tim;
+    gettimeofday(&tim, NULL);
 
-        subber->client_socket = zsocket_new(sstate.ctx, ZMQ_DEALER);
-        zsocket_connect(subber->client_socket, "tcp://%s", host);
-        MHASH_STRING_SET(sstate.hostsockets, host, subber);
-        HASH_FIND_STR(sstate.hostsockets, host, subber);
-        assert(subber);
+    session *ses;
+    HASH_FIND_STR(sstate.sessions, sessionid, ses);
+    if (ses)
+        ses->tick = tim.tv_sec;
+}
+
+int check_expired_sessions(zloop_t *loop, zmq_pollitem_t *item, void *arg) {
+    if (sstate.role != ROLE_MASTER)
+        return 0;
+    session *ses, *tmp, *copy;
+    struct timeval tim;
+    gettimeofday(&tim, NULL);
+    maneater_bin empty;
+    empty.ptr = NULL;
+
+    HASH_ITER(hh, sstate.sessions, ses, tmp) {
+        zclock_log("checking...");
+        if (tim.tv_sec - ses->tick >= SESSION_TIMEOUT) {
+            zclock_log("timeout! %s\n", ses->sessionid);
+            keyset *ks, *tmp;
+
+            /* 1. Release locks */
+            HASH_ITER(hh, ses->owns, ks, tmp) {
+                do_delete(ks->key, empty, ses);
+                HASH_DEL(ses->owns, ks);
+
+                free(ks->key);
+                free(ks);
+            }
+
+            /* 2. Remove all subs */
+            HASH_ITER(hh, ses->subs, ks, tmp) {
+                key_sub *sub = NULL;
+                HASH_FIND_STR(sstate.subs, ks->key, sub);
+                if (sub) {
+                    HASH_FIND_STR(sub->sessions, ses->sessionid, copy);
+                    if (copy) {
+                        HASH_DEL(sub->sessions, copy);
+                        free(copy);
+                    }
+                }
+
+                HASH_DEL(ses->subs, ks);
+
+                free(ks->key);
+                free(ks);
+            }
+
+
+            /* 3. Close down socket */
+            zsocket_destroy(sstate.ctx, ses->client_socket);
+            
+            /* 4. Remove from hash */
+            HASH_DEL(sstate.sessions, ses);
+
+            /* 5. Free session */
+            free(ses->sessionid);
+            free(ses);
+        }
+    }
+    return 0;
+}
+
+
+session * check_session_indexed(const char *sessionid,
+        const char *host) {
+    session *ses = NULL;
+    HASH_FIND_STR(sstate.sessions, sessionid, ses);
+
+    if (!ses) {
+        ses = (session *)malloc(sizeof (session));
+        COPY_STRING(ses->sessionid, sessionid);
+        ses->subs = NULL;
+        ses->owns = NULL;
+
+        struct timeval tim;
+        gettimeofday(&tim, NULL);
+        ses->tick = tim.tv_sec;
+
+        ses->client_socket = zsocket_new(sstate.ctx, ZMQ_DEALER);
+        zsocket_connect(ses->client_socket, "tcp://%s", host);
+        MHASH_STRING_SET(sstate.sessions, sessionid, ses);
+        HASH_FIND_STR(sstate.sessions, sessionid, ses);
+        assert(ses);
     }
 
-    return subber;
+    return ses;
 }
 
 
-int send_to_host(const char *host, zframe_t *frame) {
-    int i;
-    sublist * subber = check_subber_indexed(host, &i);
+void send_to_session(const char *sessionid, 
+        const char *host, zframe_t *frame) {
+   session * ses = check_session_indexed(sessionid, 
+           host);
 
-    assert(subber);
+   assert(ses);
 
-    zframe_send(&frame, subber->client_socket, 0);
-
-    return i;
+   zframe_send(&frame, ses->client_socket, 0);
 }
 
 void fire_update(stored_set *s, void *msock) {
@@ -115,11 +215,9 @@ void fire_update(stored_set *s, void *msock) {
         MSG_PACK_STR(pk, s->key);
         msgpack_pack_uint64(pk, s->txid);
         msgpack_pack_array(pk, s->num_values);
-        printf("values? %d\n", s->num_values);
 
         stored_value *val = NULL;
         for (val = s->values; val; val = val->next) {
-            printf("packing.. %d %s\n", val->data.size, (char*)val->data.ptr);
             msgpack_pack_raw(pk, val->data.size);
             msgpack_pack_raw_body(pk,
                 val->data.ptr,
@@ -142,14 +240,14 @@ void fire_update(stored_set *s, void *msock) {
         }
 
         key_sub *keysubs;
-        sublist *subber, *tmp;
+        session *ses, *tmp;
 
         HASH_FIND_STR(sstate.subs, s->key, keysubs);
 
         if (keysubs) {
-            HASH_ITER(hh, keysubs->subs, subber, tmp) {
+            HASH_ITER(hh, keysubs->sessions, ses, tmp) {
                 send = zframe_dup(template);
-                zframe_send(&send, subber->client_socket, 0);
+                zframe_send(&send, ses->client_socket, 0);
             }
         }
     }
@@ -160,10 +258,15 @@ void fire_update(stored_set *s, void *msock) {
 void handle_get_message(unsigned char * data, size_t len) {
     size_t off;
 
+    const char *sessionid = NULL;
     const char *host = NULL;
     const char *key = NULL;
 
     msgpack_unpacked msg;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    sessionid = msg.data.via.raw.ptr;
 
     MSG_NEXT(&msg, data, len, &off);
     assert(msg.data.type == MSGPACK_OBJECT_RAW);
@@ -174,10 +277,9 @@ void handle_get_message(unsigned char * data, size_t len) {
     key = msg.data.via.raw.ptr;
 
     int l = strlen(key);
-    int person_added;
     stored_set *s, tmp;
-    sublist *subber = check_subber_indexed(host, &person_added);
-    assert(subber);
+    session *ses = check_session_indexed(sessionid, host);
+    assert(ses);
 
     int nl = l - 1;
     if (key[nl] == '*') {
@@ -189,7 +291,7 @@ void handle_get_message(unsigned char * data, size_t len) {
             /* NOTE: nl == 0 is '*' case */
             if (strlen(s->key) >= nl
                 && (nl == 0 || !strncmp(s->key, tkey, nl))) {
-                fire_update(s, subber->client_socket);
+                fire_update(s, ses->client_socket);
             }
         }
 
@@ -205,11 +307,11 @@ void handle_get_message(unsigned char * data, size_t len) {
             s = &tmp;
         }
 
-        fire_update(s, subber->client_socket);
+        fire_update(s, ses->client_socket);
     }
 }
 
-void do_delete(const char *key, maneater_bin value) {
+void do_delete(const char *key, maneater_bin value, session *owner) {
     stored_set *s;
     stored_value *v, *tmp;
 
@@ -217,8 +319,8 @@ void do_delete(const char *key, maneater_bin value) {
     if (s) {
         txid++;
         LL_FOREACH_SAFE(s->values, v, tmp) {
-            if (!value.ptr ||
-            BINARIES_EQUAL(value, v->data)) {
+            if ((owner && owner == (session *)v->owner)
+               || (!value.ptr || BINARIES_EQUAL(value, v->data))) {
                 LL_DELETE(s->values, v);
                 free(v->data.ptr);
                 free(v);
@@ -255,7 +357,7 @@ void handle_del_message(unsigned char * data, size_t len) {
             break;
         default: assert(0); /* unknown type next */
     }
-    do_delete(key, value);
+    do_delete(key, value, NULL);
 }
 
 void handle_set_message(unsigned char * data, size_t len) {
@@ -266,7 +368,8 @@ void handle_set_message(unsigned char * data, size_t len) {
 
     const char *host = NULL;
     const char *key = NULL;
-    const char *lock = NULL;
+    const char *sessionid = NULL;
+
     maneater_bin value;
 
     msgpack_unpacked msg;
@@ -274,7 +377,7 @@ void handle_set_message(unsigned char * data, size_t len) {
     MSG_NEXT(&msg, data, len, &off);
     assert(msg.data.type == MSGPACK_OBJECT_RAW);
     host = msg.data.via.raw.ptr;
-    (void)host; // unused for now
+    session * ses = NULL;
 
     MSG_NEXT(&msg, data, len, &off);
     assert(msg.data.type == MSGPACK_OBJECT_RAW);
@@ -283,10 +386,11 @@ void handle_set_message(unsigned char * data, size_t len) {
     MSG_NEXT(&msg, data, len, &off);
     switch (msg.data.type) {
         case MSGPACK_OBJECT_RAW:
-            lock = msg.data.via.raw.ptr;
+            sessionid = msg.data.via.raw.ptr;
+            ses = check_session_indexed(sessionid, host);
             break;
         case MSGPACK_OBJECT_NIL:
-            lock = NULL;
+            sessionid = NULL;
             break;
         default:
             assert(0);
@@ -306,67 +410,55 @@ void handle_set_message(unsigned char * data, size_t len) {
 
     HASH_FIND_STR(sstate.db, key, set);
 
-    if (set) {
-        if (!limit || set->num_values < limit) {
-            for (new = set->values; new; new = new->next) {
-                if (BINARIES_EQUAL(new->data, value))
-                    return; /* set!  don't duplicate */
-            }
-            txid++;
-            new = (stored_value *)malloc(sizeof(stored_value));
-            if (lock) {
-                COPY_STRING(new->lock, lock);
-            }
-            else {
-                new->lock = NULL;
-            }
-
-            COPY_MEM(new->data.ptr, value.ptr, value.size);
-            new->data.size = value.size;
-
-            set->num_values++;
-            set->txid = txid;
-            LL_APPEND(set->values, new);
-
-            fire_update(set, NULL);
-        }
-
-    }
-    else {
-        txid++;
+    if (!set) {
         set = (stored_set *)malloc(sizeof(stored_set));
         COPY_STRING(set->key, key);
         set->values = NULL;
+        set->num_values = 0;
+        MHASH_STRING_SET(sstate.db, key, set);
+        set = NULL;
+        HASH_FIND_STR(sstate.db, key, set);
+        assert(set);
+    }
 
+    if (!limit || set->num_values < limit) {
+        for (new = set->values; new; new = new->next) {
+            if (BINARIES_EQUAL(new->data, value))
+                return; /* set!  don't duplicate */
+        }
+        txid++;
         new = (stored_value *)malloc(sizeof(stored_value));
-        if (lock) {
-            COPY_STRING(new->lock, lock);
-        }
-        else {
-            new->lock = NULL;
-        }
+        new->owner = ses;
+
         COPY_MEM(new->data.ptr, value.ptr, value.size);
         new->data.size = value.size;
 
-        set->num_values = 1;
+        set->num_values++;
         set->txid = txid;
         LL_APPEND(set->values, new);
 
-        MHASH_STRING_SET(sstate.db, key, set);
+        if (ses) {
+            keyset *own = NULL;
+            HASH_FIND_STR(ses->owns, key, own);
+            if (!own) {
+                own = (keyset *)malloc(sizeof(keyset));
+                COPY_STRING(own->key, key);
+                MHASH_STRING_SET(ses->owns, key, own);
+                own = NULL;
+                HASH_FIND_STR(ses->owns, key, own);
+                assert(own);
+            }
+        }
 
         fire_update(set, NULL);
     }
+
 }
 
-typedef struct {
-    char *key;
-    unsigned long long txid;
-} follow_pair;
-
 void handle_follow_message(unsigned char * data, size_t len) {
-    int person_added = 0;
 
     const char *host = NULL;
+    const char *sessionid = NULL;
     uint64_t txid;
     msgpack_unpacked msg;
     size_t off;
@@ -374,10 +466,14 @@ void handle_follow_message(unsigned char * data, size_t len) {
 
     MSG_NEXT(&msg, data, len, &off);
     assert(msg.data.type == MSGPACK_OBJECT_RAW);
+    sessionid = msg.data.via.raw.ptr;
+
+    MSG_NEXT(&msg, data, len, &off);
+    assert(msg.data.type == MSGPACK_OBJECT_RAW);
     host = msg.data.via.raw.ptr;
 
     key_sub *subkey;
-    sublist *subber = check_subber_indexed(host, &person_added);
+    session *ses = check_session_indexed(sessionid, host);
 
     MSG_NEXT(&msg, data, len, &off);
     assert(msg.data.type == MSGPACK_OBJECT_ARRAY);
@@ -397,28 +493,28 @@ void handle_follow_message(unsigned char * data, size_t len) {
         assert(obj->type == MSGPACK_OBJECT_POSITIVE_INTEGER);
         txid = obj->via.u64;
 
-        printf("doing for %s %llu\n", key, (long long unsigned)txid);
-
         HASH_FIND_STR(sstate.subs, key, subkey);
 
         if (!subkey) {
             subkey = (key_sub *)malloc(sizeof(key_sub));
             COPY_STRING(subkey->key, key);
-            subkey->subs = NULL;
+            subkey->sessions = NULL;
 
             MHASH_STRING_SET(sstate.subs, key, subkey);
         }
 
-        sublist *app;
-        HASH_FIND_STR(subkey->subs, host, app);
+        session *app;
+        HASH_FIND_STR(subkey->sessions, sessionid, app);
         if (!app) {
-            /* need a copy for the HT */
-            app = (sublist *)malloc(sizeof(sublist));
+            /* need a copy for the HT
+             * different hashtable than the
+             * sessionid-keyed one */
+            app = (session *)malloc(sizeof(session));
 
             /* NOTE -- pointer to host char * and 
              * socket char * is copied here */
-            memcpy(app, subber, sizeof(sublist));
-            MHASH_STRING_SET(subkey->subs, host, app);
+            memcpy(app, ses, sizeof(session));
+            MHASH_STRING_SET(subkey->sessions, sessionid, app);
         }
 
         stored_set *ss;
@@ -429,10 +525,21 @@ void handle_follow_message(unsigned char * data, size_t len) {
             s.values = NULL;
             s.txid = 0;
             s.num_values = 0;
-            fire_update(&s, subber->client_socket);
+            fire_update(&s, ses->client_socket);
         }
         else if (ss && ss->txid != txid)
-            fire_update(ss, subber->client_socket);
+            fire_update(ss, ses->client_socket);
+
+        keyset *find;
+        HASH_FIND_STR(ses->subs, key, find);
+        if (!find) {
+            find = (keyset *)malloc(sizeof(keyset));
+            COPY_STRING(find->key, key);
+            MHASH_STRING_SET(ses->subs, key, find);
+            find = NULL;
+            HASH_FIND_STR(ses->subs, key, find);
+            assert(find);
+        }
     }
 }
 

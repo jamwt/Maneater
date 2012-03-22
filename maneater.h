@@ -22,6 +22,7 @@ typedef enum {
 
 #define NODEID_LEN (8 + UUID_SIZE + 1)
 #define HOSTID_LEN (150)
+#define SESSION_TIMEOUT 6
 
 // MAXINT(64)
 #define START_TXID 0xffffffffffffffff
@@ -39,8 +40,11 @@ void start_slave(zctx_t *ctx, void *master_socket);
 void end_master(zctx_t *ctx);
 void end_slave(zctx_t *ctx);
 
-int send_to_host(const char *host, zframe_t *frame);
+int check_expired_sessions(zloop_t *loop, zmq_pollitem_t *item, void *arg);
+void send_to_session(const char *sessionid, 
+        const char *host, zframe_t *frame);
 void set_init();
+void touch_session(const char *sessionid);
 void handle_set_message(unsigned char * data, size_t len);
 void handle_follow_message(unsigned char * data, size_t len);
 void handle_get_message(unsigned char * data, size_t len);
