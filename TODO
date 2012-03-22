@@ -2,9 +2,11 @@
  [ ] get * boundaries
  [ ] slave sync (get *)
  [ ] ensure slave sub relay works correctly (value handling)
- [ ] client sockets get closed/killed if no activity
+ [x] client sockets get closed/killed if no activity
      in N seconds
  [ ] favor a slave for subs
  [ ] client clean finalization (free() etc on early cluster death)
+ [ ] set hwm to not fill up all memory on sockets; generalize socket
+     creation call
 
  [?] Change socket type or use NOBLOCK to prevent blocking?
