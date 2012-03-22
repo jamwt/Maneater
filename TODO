@@ -1,12 +1,19 @@
- [ ] timeouts remove locks (and lock tracking)
- [ ] get * boundaries
- [ ] slave sync (get *)
- [ ] ensure slave sub relay works correctly (value handling)
+V1
+--
  [x] client sockets get closed/killed if no activity
      in N seconds
- [ ] favor a slave for subs
+ [x] timeouts remove locks (and lock tracking)
+ [ ] slave sync (get *?  value needs owner information)
+ [ ] ensure slave sub relay works correctly (value handling)
  [ ] client clean finalization (free() etc on early cluster death)
- [ ] set hwm to not fill up all memory on sockets; generalize socket
-     creation call
+ [ ] set ZMQ HWM to not fill up all memory on sockets; generalize socket
+     creation call; might need to go to pub/sub so we drop instead of
+     block
+ [ ] break out valgrind and knock down any leaks
 
+
+V2?
+--
  [?] Change socket type or use NOBLOCK to prevent blocking?
+ [?] client favor a slave for subs (requires a sort of "slave is alive"
+     assurance).  just do master for now.
